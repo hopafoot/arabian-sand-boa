@@ -1,4 +1,5 @@
 # arabian_sand_boa
+<img width="338" height="338" alt="image" src="https://github.com/user-attachments/assets/02cc403e-8169-4d85-a4a6-f98a52d21a49" />
 
 Run a Python file where **string `if` conditions are decided by an LLM**.
 
