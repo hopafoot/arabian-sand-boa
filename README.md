@@ -12,8 +12,6 @@ other condition resolves the normal way via `bool()`.
 ## Usage
 
 ```sh
-python3 arabian_sand_boa <file.py> [args...]
-python3 arabian_sand_boa --debug <file.py> [args...]
 ./arabian_sand_boa <file.py> [args...]          # it's executable
 ```
 
