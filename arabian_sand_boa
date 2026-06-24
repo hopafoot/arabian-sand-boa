@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""arabian_sand_boa: run a Python file where string `if` conditions are decided by an LLM.
+
+Usage:
+    python3 arabian_sand_boa [--debug] <file.py> [args...]
+    ./arabian_sand_boa [--debug] <file.py> [args...]   # if executable
+
+Every `if`/`elif` condition in the target file is rewritten at the AST level
+into a call to a hook. The hook only consults the LLM when the condition
+resolves to a non-empty string (a natural-language clause); it sends the
+in-scope variables and the clause to the model and uses the True/False reply to
+decide the branch. Every other condition resolves the normal way via bool().
+
+Configuration is read from the environment (only when an LLM call is actually
+made):
+
+    BOA_LLM_URL        full chat-completions endpoint URL
+    BOA_LLM_API_KEY    bearer token for that endpoint
+    BOA_LLM_MODEL      model name to request
+
+No third-party dependencies -- standard library only.
+"""
+import ast
+import inspect
+import json
+import os
+import sys
+import urllib.request
+
+DEBUG = False  # set by the --debug CLI flag; prints each prompt sent to the LLM
+
+SYSTEM_PROMPT = (
+    "You are evaluating a Python `if` whose condition is a natural-language "
+    "clause. Given the in-scope variables, decide whether the clause holds. "
+    "Output ONLY the single word True or False, with no other text."
+)
+
+
+def _llm_decide(system, user):
+    """POST a chat-completions request and return the assistant's reply text."""
+    url = os.environ.get("BOA_LLM_URL")
+    key = os.environ.get("BOA_LLM_API_KEY")
+    model = os.environ.get("BOA_LLM_MODEL")
+    missing = [
+        name
+        for name, value in (
+            ("BOA_LLM_URL", url),
+            ("BOA_LLM_API_KEY", key),
+            ("BOA_LLM_MODEL", model),
+        )
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(
+            "Missing required environment variable(s): " + ", ".join(missing)
+        )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as resp:
+        data = json.load(resp)
+    return data["choices"][0]["message"]["content"]
+
+
+def __if_hook__(cond, clause):
+    """Called in place of every `if`/`elif` condition in the target file.
+
+    Only consults the LLM when the condition resolves to a non-empty string
+    (a natural-language clause). For anything else, actually resolve the
+    condition with bool() and proceed normally.
+
+    When it does consult the LLM, it sends the in-scope (non-dunder) variables
+    and the clause and lets the model decide the branch. Parses the reply as
+    True/False; if the answer is anything else, err on the side of caution and
+    take the True path.
+    """
+    if not (isinstance(cond, str) and cond):
+        return bool(cond)
+
+    caller_locals = inspect.currentframe().f_back.f_locals
+    scope = {
+        name: value
+        for name, value in caller_locals.items()
+        if not (name.startswith("__") and name.endswith("__"))
+    }
+    scope_str = "\n".join(f"{k} = {v!r}" for k, v in scope.items()) or "(none)"
+
+    user_prompt = (
+        f"In-scope variables:\n{scope_str}\n\n"
+        f"Clause:\n{cond}\n\n"
+        "Does this clause hold? Reply with only True or False."
+    )
+    if DEBUG:
+        print("=" * 60, file=sys.stderr)
+        print("[boa] SYSTEM:\n" + SYSTEM_PROMPT, file=sys.stderr)
+        print("[boa] USER:\n" + user_prompt, file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+
+    raw = _llm_decide(SYSTEM_PROMPT, user_prompt)
+    if DEBUG:
+        print(f"[boa] LLM RESPONSE: {raw!r}", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+
+    answer = raw.strip().lower()
+    if answer == "true":
+        return True
+    if answer == "false":
+        return False
+    return True  # unknown -> err on the side of caution -> take the True path
+
+
+class _IfTransformer(ast.NodeTransformer):
+    """Wrap each `if`/`elif` test in a call to __if_hook__(test, "<source>")."""
+
+    def visit_If(self, node):
+        self.generic_visit(node)  # recurse first so elif/nested ifs are covered
+        clause_src = ast.unparse(node.test)
+        node.test = ast.Call(
+            func=ast.Name(id="__if_hook__", ctx=ast.Load()),
+            args=[node.test, ast.Constant(value=clause_src)],
+            keywords=[],
+        )
+        return node
+
+
+def run(path, argv):
+    with open(path) as f:
+        source = f.read()
+
+    tree = _IfTransformer().visit(ast.parse(source, filename=path))
+    ast.fix_missing_locations(tree)
+    code = compile(tree, path, "exec", dont_inherit=True)
+
+    namespace = {
+        "__name__": "__main__",   # so the target's `if __name__ ...` block runs
+        "__file__": path,
+        "__builtins__": __builtins__,
+        "__if_hook__": __if_hook__,
+    }
+
+    sys.argv = [path, *argv]      # hand the target its own argv
+    exec(code, namespace)
+
+
+def main():
+    global DEBUG
+    args = sys.argv[1:]
+    if args and args[0] in ("--debug", "-d"):
+        DEBUG = True
+        args = args[1:]
+    if not args:
+        print("usage: arabian_sand_boa [--debug] <file.py> [args...]", file=sys.stderr)
+        sys.exit(2)
+    run(args[0], args[1:])
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,6 @@
+# Local secrets / config
+.env
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
